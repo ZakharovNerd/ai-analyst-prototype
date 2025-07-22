@@ -1,0 +1,11 @@
+langgraph>=0.0.69
+langchain>=0.2.0
+langchain-openai>=0.1.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+twilio>=8.5.0
+openai>=1.0.0
+langsmith>=0.1.0
+python_multipart==0.0.20
