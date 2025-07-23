@@ -47,7 +47,13 @@ orders_df sample: {self.orders_df.head(2).to_dict('records')}
                 'users_df': self.users_df.copy(),
                 'orders_df': self.orders_df.copy(),
                 'pd': pd,
-                'datetime': datetime
+                'datetime': datetime,
+                'len': len,
+                'sum': sum,
+                'min': min,
+                'max': max,
+                'round': round,
+                'set': set
             }
             
             exec(code, {"__builtins__": {}}, local_vars)
@@ -55,8 +61,9 @@ orders_df sample: {self.orders_df.head(2).to_dict('records')}
             if 'result' in local_vars:
                 return local_vars['result'], None
             else:
+                excluded_vars = {'users_df', 'orders_df', 'pd', 'datetime', 'len', 'sum', 'min', 'max', 'round', 'set'}
                 for var_name, var_value in local_vars.items():
-                    if var_name not in ['users_df', 'orders_df', 'pd', 'datetime']:
+                    if var_name not in excluded_vars:
                         if not var_name.startswith('_'):
                             return var_value, None
                 

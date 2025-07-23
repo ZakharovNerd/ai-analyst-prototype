@@ -14,7 +14,7 @@ def run_evaluation():
     )
     
     dataset_name = "vividmoney-analytics"
-    project_name = "vividmoney-evaluation-run"
+    project_name = "vividmoney-structured-outputs-v5"
     
     print(f"Запускаем оценку на датасете: {dataset_name}")
     print(f"Проект: {project_name}")

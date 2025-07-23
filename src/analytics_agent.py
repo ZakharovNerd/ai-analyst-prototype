@@ -4,25 +4,36 @@ from dataclasses import dataclass
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 from .data_processor import DataProcessor
 import logging
 
 logger = logging.getLogger(__name__)
 
+class CodeGenResponse(BaseModel):
+    reasoning: str = Field(description="Логика и рассуждения о том, как решить задачу")
+    pandas_code: str = Field(description="Pandas код для выполнения")
+
+class AnswerResponse(BaseModel):
+    reasoning: str = Field(description="Анализ результатов и логика формирования ответа")
+    final_answer: str = Field(description="Финальный ответ пользователю")
+
 @dataclass
 class AnalyticsState:
     user_query: str
     pandas_code: str | None = None
+    code_reasoning: str | None = None
     execution_result: Any = None
     execution_error: str | None = None
     final_answer: str | None = None
+    answer_reasoning: str | None = None
     retry_count: int = 0
     max_retries: int = 3
 
 class AnalyticsAgent:
     def __init__(self, openai_api_key: str):
         self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0,
             api_key=openai_api_key
         )
@@ -64,13 +75,21 @@ class AnalyticsAgent:
 1. Всегда присваивай финальный результат переменной 'result'
 2. Используй только pandas операции
 3. Для дат используй формат 2024-06-01 (год-месяц-день)
-4. Для фильтрации по июню 2024: df['date_column'].dt.month == 6 & df['date_column'].dt.year == 2024
-5. Не используй импорты - pandas уже доступен как 'pd'
-6. Возвращай только код, без объяснений
+4. Не используй импорты - pandas уже доступен как 'pd'
+5. КРИТИЧНО: При работе с заказами учитывай статус:
+   - Для расчета среднего чека, конверсии, LTV используй только 'completed' заказы
+   - Отмененные ('canceled') и ожидающие ('pending') заказы исключай из расчетов доходов
+   - Для общей статистики заказов можешь использовать все статусы
 
 Примеры:
-- "активные пользователи по регионам за июнь" → june_users = users_df[(users_df['registration_date'].dt.month == 6) & (users_df['registration_date'].dt.year == 2024) & (users_df['is_active'] == True)]
-result = june_users.groupby('region').size()"""
+- "активные пользователи по регионам за июнь" → june_2024_active = users_df[
+    (users_df['last_login_date'].dt.year == 2024) & 
+    (users_df['last_login_date'].dt.month == 6) &
+    (users_df['is_active'] == True)
+]
+result = june_2024_active.groupby('region').size()
+
+Сначала объясни свою логику, затем предоставь код."""
         
         error_context = ""
         if state.execution_error and state.retry_count > 0:
@@ -81,16 +100,11 @@ result = june_users.groupby('region').size()"""
             HumanMessage(content=state.user_query)
         ]
         
-        response = self.llm.invoke(messages)
+        structured_llm = self.llm.with_structured_output(CodeGenResponse)
+        response = structured_llm.invoke(messages)
         
-        code = response.content.strip()
-        if code.startswith("```python"):
-            code = code[9:]
-        if code.endswith("```"):
-            code = code[:-3]
-        code = code.strip()
-        
-        state.pandas_code = code
+        state.pandas_code = response.pandas_code
+        state.code_reasoning = response.reasoning
         return state
     
     def _execute_code(self, state: AnalyticsState) -> AnalyticsState:
@@ -132,15 +146,19 @@ result = june_users.groupby('region').size()"""
 - "Активные пользователи по регионам за июнь 2024: Москва - 15, СПб - 12, Казань - 8"
 - "Конверсия регистрации → покупка за июнь 2024: 25,4% (254 из 1000 пользователей)"
 - "Средний чек по регионам за июнь: Москва - 8500₽, СПб - 7200₽, Казань - 6800₽"
-"""
+
+Сначала проанализируй данные и логику ответа, затем дай финальный ответ."""
         
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=f"Пользовательский запрос: {state.user_query}\n\nРезультат pandas: {state.execution_result}")
         ]
         
-        response = self.llm.invoke(messages)
-        state.final_answer = response.content.strip()
+        structured_llm = self.llm.with_structured_output(AnswerResponse)
+        response = structured_llm.invoke(messages)
+        
+        state.final_answer = response.final_answer
+        state.answer_reasoning = response.reasoning
         
         return state
     

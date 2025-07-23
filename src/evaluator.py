@@ -45,11 +45,34 @@ class AnswerEvaluator:
             analyst = AnalyticsAgent(self.openai_api_key)
             user_request = self.extract_user_request(input_data)
             
-            result = analyst.process_query(user_request)
+            from .analytics_agent import AnalyticsState
+            initial_state = AnalyticsState(user_query=user_request)
+            final_state = analyst.graph.invoke(initial_state)
+            
+            if hasattr(final_state, 'final_answer'):
+                result = final_state.final_answer or "Не удалось обработать запрос"
+                code_reasoning = getattr(final_state, 'code_reasoning', '')
+                answer_reasoning = getattr(final_state, 'answer_reasoning', '')
+                pandas_code = getattr(final_state, 'pandas_code', '')
+                execution_result = getattr(final_state, 'execution_result', '')
+            else:
+                result = final_state.get('final_answer') or "Не удалось обработать запрос"
+                code_reasoning = final_state.get('code_reasoning', '')
+                answer_reasoning = final_state.get('answer_reasoning', '')
+                pandas_code = final_state.get('pandas_code', '')
+                execution_result = final_state.get('execution_result', '')
+            
             time.sleep(0.02)
+            
+            data_schema = analyst.data_processor.get_data_schema()
             
             return {
                 "answer": result,
+                "code_reasoning": code_reasoning,
+                "answer_reasoning": answer_reasoning,
+                "pandas_code": pandas_code,
+                "execution_result": execution_result,
+                "data_schema": data_schema,
                 "success": True
             }
         except Exception as e:
