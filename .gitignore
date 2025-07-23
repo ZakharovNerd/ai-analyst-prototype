@@ -7,3 +7,4 @@ venv/
 .DS_Store
 server.log
 .vercel/
+task.txt

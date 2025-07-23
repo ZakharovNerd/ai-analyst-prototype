@@ -1,4 +1,4 @@
-# VividMoney AI Analytics Assistant
+# AI Analytics Assistant
 
 WhatsApp-интегрированный AI ассистент для бизнес-аналитики с использованием LangGraph и автоматической оценкой через LangSmith.
 
