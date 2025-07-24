@@ -10,9 +10,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-class CodeGenResponse(BaseModel):
+class QueryResponse(BaseModel):
+    requires_code: bool = Field(description="Требует ли запрос выполнения pandas кода")
     reasoning: str = Field(description="Логика и рассуждения о том, как решить задачу")
-    pandas_code: str = Field(description="Pandas код для выполнения")
+    pandas_code: str | None = Field(description="Pandas код для выполнения (если requires_code=True)", default=None)
+    direct_answer: str | None = Field(description="Прямой ответ без кода (если requires_code=False)", default=None)
 
 class AnswerResponse(BaseModel):
     reasoning: str = Field(description="Анализ результатов и логика формирования ответа")
@@ -21,6 +23,7 @@ class AnswerResponse(BaseModel):
 @dataclass
 class AnalyticsState:
     user_query: str
+    requires_data_analysis: bool | None = None
     pandas_code: str | None = None
     code_reasoning: str | None = None
     execution_result: Any = None
@@ -43,18 +46,26 @@ class AnalyticsAgent:
     def _build_graph(self):
         workflow = StateGraph(AnalyticsState)
         
-        workflow.add_node("code_generator", self._generate_pandas_code)
+        workflow.add_node("query_processor", self._process_query)
         workflow.add_node("code_executor", self._execute_code)
         workflow.add_node("answer_formatter", self._format_answer)
         
-        workflow.set_entry_point("code_generator")
-        workflow.add_edge("code_generator", "code_executor")
+        workflow.set_entry_point("query_processor")
+        
+        workflow.add_conditional_edges(
+            "query_processor",
+            self._route_after_query_processing,
+            {
+                "execute": "code_executor",
+                "end": END
+            }
+        )
         
         workflow.add_conditional_edges(
             "code_executor",
             self._should_retry,
             {
-                "retry": "code_generator",
+                "retry": "query_processor",
                 "format": "answer_formatter"
             }
         )
@@ -63,33 +74,32 @@ class AnalyticsAgent:
         
         return workflow.compile()
     
-    def _generate_pandas_code(self, state: AnalyticsState) -> AnalyticsState:
+    def _process_query(self, state: AnalyticsState) -> AnalyticsState:
         data_schema = self.data_processor.get_data_schema()
         
-        system_prompt = f"""Ты эксперт по pandas. Преобразуй пользовательский запрос в код pandas.
+        system_prompt = f"""Ты AI ассистент по аналитике данных. Определи, требует ли запрос анализа данных или это обычный вопрос.
 
-Доступные данные:
+Доступные данные для анализа:
 {data_schema}
 
-ВАЖНО:
+Если запрос требует анализа данных (requires_code=true):
+- Вопросы о количестве, статистике, метриках
+- Расчеты конверсии, LTV, средних значений  
+- Группировки по регионам, датам
+- Анализ пользователей, заказов
+
+Правила для pandas кода:
 1. Всегда присваивай финальный результат переменной 'result'
 2. Используй только pandas операции
 3. Для дат используй формат 2024-06-01 (год-месяц-день)
-4. Не используй импорты - pandas уже доступен как 'pd'
-5. КРИТИЧНО: При работе с заказами учитывай статус:
-   - Для расчета среднего чека, конверсии, LTV используй только 'completed' заказы
-   - Отмененные ('canceled') и ожидающие ('pending') заказы исключай из расчетов доходов
-   - Для общей статистики заказов можешь использовать все статусы
+4. КРИТИЧНО: При работе с заказами учитывай статус - используй только 'completed' для расчетов доходов
 
-Примеры:
-- "активные пользователи по регионам за июнь" → june_2024_active = users_df[
-    (users_df['last_login_date'].dt.year == 2024) & 
-    (users_df['last_login_date'].dt.month == 6) &
-    (users_df['is_active'] == True)
-]
-result = june_2024_active.groupby('region').size()
+Если запрос НЕ требует анализа данных (requires_code=false):
+- Приветствия, благодарности
+- Вопросы о возможностях бота
+- Общие вопросы без привязки к данным
 
-Сначала объясни свою логику, затем предоставь код."""
+Сначала объясни логику, затем предоставь либо код, либо прямой ответ."""
         
         error_context = ""
         if state.execution_error and state.retry_count > 0:
@@ -100,32 +110,58 @@ result = june_2024_active.groupby('region').size()
             HumanMessage(content=state.user_query)
         ]
         
-        structured_llm = self.llm.with_structured_output(CodeGenResponse)
+        structured_llm = self.llm.with_structured_output(QueryResponse)
         response = structured_llm.invoke(messages)
         
-        state.pandas_code = response.pandas_code
+        state.requires_data_analysis = response.requires_code
         state.code_reasoning = response.reasoning
+        
+        if response.requires_code:
+            state.pandas_code = response.pandas_code
+        else:
+            state.final_answer = response.direct_answer
+        
         return state
+    
+    def _route_after_query_processing(self, state: AnalyticsState) -> str:
+        return "execute" if state.requires_data_analysis else "end"
     
     def _execute_code(self, state: AnalyticsState) -> AnalyticsState:
         if not state.pandas_code:
+            logger.warning("No pandas code generated for execution")
             state.execution_error = "No pandas code generated"
             return state
         
+        logger.info(f"Executing pandas code (attempt {state.retry_count + 1}): {state.pandas_code[:100]}...")
         result, error = self.data_processor.execute_pandas_query(state.pandas_code)
         
         if error:
+            logger.warning(f"Code execution failed (attempt {state.retry_count + 1}): {error}")
             state.execution_error = error
             state.retry_count += 1
         else:
-            state.execution_result = result
+            logger.info(f"Code execution successful. Result type: {type(result)}")
+            # Convert pandas objects to a more manageable format
+            if hasattr(result, 'to_dict'):
+                state.execution_result = result.to_dict('records')
+            elif hasattr(result, 'to_json'):
+                state.execution_result = result.to_json(orient='split')
+            else:
+                state.execution_result = result
             state.execution_error = None
         
         return state
     
     def _should_retry(self, state: AnalyticsState) -> str:
         if state.execution_error and state.retry_count < state.max_retries:
+            logger.info(f"Retrying code generation (attempt {state.retry_count + 1}/{state.max_retries})")
             return "retry"
+        
+        if state.execution_error:
+            logger.error(f"Max retries exceeded. Final error: {state.execution_error}")
+        else:
+            logger.info("Code execution successful, proceeding to answer formatting")
+        
         return "format"
     
     def _format_answer(self, state: AnalyticsState) -> AnalyticsState:
@@ -141,11 +177,11 @@ result = june_2024_active.groupby('region').size()
 3. Добавляй контекст если нужно
 4. Не объясняй как получен результат
 5. Формат: одно-два предложения максимум
+6. КРИТИЧНО: Используй точку (.) как десятичный разделитель (например, 25.4%).
+7. КРИТИЧНО: Не используй специальные символы (например, →, ₽). Заменяй их текстом (например, '->', 'руб.').
 
 Примеры хороших ответов:
 - "Активные пользователи по регионам за июнь 2024: Москва - 15, СПб - 12, Казань - 8"
-- "Конверсия регистрации → покупка за июнь 2024: 25,4% (254 из 1000 пользователей)"
-- "Средний чек по регионам за июнь: Москва - 8500₽, СПб - 7200₽, Казань - 6800₽"
 
 Сначала проанализируй данные и логику ответа, затем дай финальный ответ."""
         

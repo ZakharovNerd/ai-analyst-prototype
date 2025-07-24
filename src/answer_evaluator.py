@@ -1,14 +1,21 @@
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from typing import Dict, Any
+from openai import OpenAI
 import logging
 
 logger = logging.getLogger(__name__)
 
+class EvaluationResult:
+    def __init__(self, score: int, reasoning: str):
+        self.score = score
+        self.reasoning = reasoning
+
 class AnswerEvaluator:
     def __init__(self, openai_api_key: str):
+        self.client = OpenAI(api_key=openai_api_key)
         self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0,
             api_key=openai_api_key
         )
@@ -16,22 +23,33 @@ class AnswerEvaluator:
     def evaluate_answer(self, user_query: str, answer: str, pandas_code: str = "", execution_result: str = "", code_reasoning: str = "", answer_reasoning: str = "") -> Dict[str, Any]:
         """Оценивает ответ по 3 критериям: correctness, conciseness, code_checker"""
         
-        correctness_score = self._evaluate_correctness(user_query, answer, execution_result, answer_reasoning)
-        conciseness_score = self._evaluate_conciseness(user_query, answer, answer_reasoning)
-        code_checker_score = self._evaluate_code_quality(pandas_code, user_query, code_reasoning)
+        correctness_result = self._evaluate_correctness(user_query, answer, execution_result, answer_reasoning)
+        conciseness_result = self._evaluate_conciseness(user_query, answer, answer_reasoning)
         
-        # Общая оценка (среднее арифметическое)
-        overall_score = round((correctness_score + conciseness_score + code_checker_score) / 3)
+        # Оценка кода только если есть pandas_code
+        if pandas_code and pandas_code.strip():
+            code_checker_result = self._evaluate_code_quality(pandas_code, user_query, code_reasoning)
+            scores = [correctness_result.score, conciseness_result.score, code_checker_result.score]
+        else:
+            code_checker_result = None
+            scores = [correctness_result.score, conciseness_result.score]
+        
+        # Общая оценка (среднее арифметическое только для не-None значений)
+        valid_scores = [s for s in scores if s is not None]
+        overall_score = round(sum(valid_scores) / len(valid_scores)) if valid_scores else None
         
         return {
-            "correctness": correctness_score,
-            "conciseness": conciseness_score, 
-            "code_checker": code_checker_score,
+            "correctness": correctness_result.score,
+            "conciseness": conciseness_result.score, 
+            "code_checker": code_checker_result.score if code_checker_result else None,
             "overall_score": overall_score,
-            "evaluation_text": f"Оценка качества ответа: {overall_score} из 5 (полностью соответствует запросу)" if overall_score == 5 else f"Оценка качества ответа: {overall_score} из 5 (частично соответствует запросу)"
+            "correctness_reasoning": correctness_result.reasoning,
+            "conciseness_reasoning": conciseness_result.reasoning,
+            "code_reasoning": code_checker_result.reasoning if code_checker_result else "No code to evaluate",
+            "evaluation_text": f"Оценка качества ответа: {overall_score} из 5" if overall_score is not None else "Ошибка при оценке качества ответа"
         }
     
-    def _evaluate_correctness(self, user_query: str, answer: str, execution_result: str, answer_reasoning: str = "") -> int:
+    def _evaluate_correctness(self, user_query: str, answer: str, execution_result: str, answer_reasoning: str = "") -> EvaluationResult:
         """Оценка корректности ответа"""
         correctness_prompt = """
         You are an expert data labeler evaluating model outputs for correctness. Your task is to assign a score based on the following rubric:
@@ -86,14 +104,37 @@ class AnswerEvaluator:
         ]
         
         try:
-            response = self.llm.invoke(messages)
-            score = int(response.content.strip())
-            return max(1, min(5, score))
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": prompt_with_data},
+                    {"role": "user", "content": "Оцени от 1 до 5 и предоставь reasoning:"}
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "evaluation_result",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                                "reasoning": {"type": "string"}
+                            },
+                            "required": ["score", "reasoning"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            )
+            
+            import json
+            result = json.loads(response.choices[0].message.content)
+            return EvaluationResult(result["score"], result["reasoning"])
         except Exception:
             logger.exception("Error evaluating correctness")
-            return 3
+            return EvaluationResult(None, "Error occurred during evaluation")
     
-    def _evaluate_conciseness(self, user_query: str, answer: str, answer_reasoning: str = "") -> int:
+    def _evaluate_conciseness(self, user_query: str, answer: str, answer_reasoning: str = "") -> EvaluationResult:
         """Оценка краткости ответа"""
         conciseness_prompt = """
 You are an expert data labeler evaluating model outputs for conciseness. Your task is to assign a score based on the following rubric:
@@ -138,9 +179,8 @@ You are an expert data labeler evaluating model outputs for conciseness. Your ta
         
         # Заменяем плейсхолдеры реальными данными
         inputs = user_query
-        outputs = f"Ответ: {answer}"
-        if answer_reasoning:
-            outputs += f"\nЛогика формирования ответа: {answer_reasoning}"
+        outputs = answer
+
         
         prompt_with_data = conciseness_prompt.replace("{{inputs}}", inputs).replace("{{outputs}}", outputs)
         
@@ -150,14 +190,37 @@ You are an expert data labeler evaluating model outputs for conciseness. Your ta
         ]
         
         try:
-            response = self.llm.invoke(messages)
-            score = int(response.content.strip())
-            return max(1, min(5, score))
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": prompt_with_data},
+                    {"role": "user", "content": "Оцени от 1 до 5 и предоставь reasoning:"}
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "evaluation_result",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                                "reasoning": {"type": "string"}
+                            },
+                            "required": ["score", "reasoning"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            )
+            
+            import json
+            result = json.loads(response.choices[0].message.content)
+            return EvaluationResult(result["score"], result["reasoning"])
         except Exception:
             logger.exception("Error evaluating conciseness")
-            return 3
+            return EvaluationResult(None, "Error occurred during evaluation")
     
-    def _evaluate_code_quality(self, pandas_code: str, user_query: str, code_reasoning: str = "") -> int:
+    def _evaluate_code_quality(self, pandas_code: str, user_query: str, code_reasoning: str = "") -> EvaluationResult:
         """Оценка качества сгенерированного кода"""
         code_checker_prompt = """
         You are an expert code reviewer evaluating code for correctness. Your task is to assign a score based on the following rubric:
@@ -214,9 +277,32 @@ You are an expert data labeler evaluating model outputs for conciseness. Your ta
         ]
         
         try:
-            response = self.llm.invoke(messages)
-            score = int(response.content.strip())
-            return max(1, min(5, score))
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": prompt_with_data},
+                    {"role": "user", "content": "Оцени от 1 до 5 и предоставь reasoning:"}
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "evaluation_result",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "score": {"type": "integer", "minimum": 1, "maximum": 5},
+                                "reasoning": {"type": "string"}
+                            },
+                            "required": ["score", "reasoning"],
+                            "additionalProperties": False
+                        }
+                    }
+                }
+            )
+            
+            import json
+            result = json.loads(response.choices[0].message.content)
+            return EvaluationResult(result["score"], result["reasoning"])
         except Exception:
             logger.exception("Error evaluating code quality")
-            return 3
+            return EvaluationResult(None, "Error occurred during evaluation")
